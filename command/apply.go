@@ -2,6 +2,7 @@ package command
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,7 +26,7 @@ type ApplyCommand struct {
 }
 
 func (c *ApplyCommand) Run(args []string) int {
-	var destroyForce, refresh, autoApprove bool
+	var destroyForce, refresh, autoApprove, jsonOutput bool
 	args = c.Meta.process(args)
 	cmdName := "apply"
 	if c.Destroy {
@@ -38,6 +39,7 @@ func (c *ApplyCommand) Run(args []string) int {
 		cmdFlags.BoolVar(&destroyForce, "force", false, "deprecated: same as auto-approve")
 	}
 	cmdFlags.BoolVar(&refresh, "refresh", true, "refresh")
+	cmdFlags.BoolVar(&jsonOutput, "json", false, "output JSON format")
 	cmdFlags.IntVar(&c.Meta.parallelism, "parallelism", DefaultParallelism, "parallelism")
 	cmdFlags.StringVar(&c.Meta.statePath, "state", "", "path")
 	cmdFlags.StringVar(&c.Meta.stateOutPath, "state-out", "", "path")
@@ -54,25 +56,25 @@ func (c *ApplyCommand) Run(args []string) int {
 	args = cmdFlags.Args()
 	configPath, err := ModulePath(args)
 	if err != nil {
-		c.Ui.Error(err.Error())
-		return 1
+		diags = diags.Append(err.Error())
+		return c.showResults(diags, jsonOutput)
 	}
 
 	// Check for user-supplied plugin path
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
-		c.Ui.Error(fmt.Sprintf("Error loading plugin path: %s", err))
-		return 1
+		diags = diags.Append(fmt.Sprintf("Error loading plugin path: %s", err))
+		return c.showResults(diags, jsonOutput)
 	}
 
 	// Check if the path is a plan
 	planFile, err := c.PlanFile(configPath)
 	if err != nil {
-		c.Ui.Error(err.Error())
-		return 1
+		diags = diags.Append(err.Error())
+		return c.showResults(diags, jsonOutput)
 	}
 	if c.Destroy && planFile != nil {
-		c.Ui.Error(fmt.Sprintf("Destroy can't be called with a plan file."))
-		return 1
+		diags = diags.Append(fmt.Sprintf("Destroy can't be called with a plan file."))
+		return c.showResults(diags, jsonOutput)
 	}
 	if planFile != nil {
 		// Reset the config path for backend loading
@@ -84,7 +86,8 @@ func (c *ApplyCommand) Run(args []string) int {
 				"Can't set variables when applying a saved plan",
 				"The -var and -var-file options cannot be used when applying a saved plan file, because a saved plan includes the variable values that were set when it was created.",
 			))
-			c.showDiagnostics(diags)
+			// Double check this always returns 1
+			c.showResults(diags, jsonOutput)
 			return 1
 		}
 	}
@@ -96,8 +99,7 @@ func (c *ApplyCommand) Run(args []string) int {
 		backendConfig, configDiags := c.loadBackendConfig(configPath)
 		diags = diags.Append(configDiags)
 		if configDiags.HasErrors() {
-			c.showDiagnostics(diags)
-			return 1
+			return c.showResults(diags, jsonOutput)
 		}
 
 		be, beDiags = c.Backend(&BackendOpts{
@@ -111,7 +113,8 @@ func (c *ApplyCommand) Run(args []string) int {
 				"Failed to read plan from plan file",
 				fmt.Sprintf("Cannot read the plan from the given plan file: %s.", err),
 			))
-			c.showDiagnostics(diags)
+			// Assert always returns 1
+			c.showResults(diags, jsonOutput)
 			return 1
 		}
 		if plan.Backend.Config == nil {
@@ -121,22 +124,32 @@ func (c *ApplyCommand) Run(args []string) int {
 				"Failed to read plan from plan file",
 				fmt.Sprintf("The given plan file does not have a valid backend configuration. This is a bug in the Terraform command that generated this plan file."),
 			))
-			c.showDiagnostics(diags)
+			c.showResults(diags, jsonOutput)
 			return 1
 		}
 		be, beDiags = c.BackendForPlan(plan.Backend)
 	}
 	diags = diags.Append(beDiags)
 	if beDiags.HasErrors() {
-		c.showDiagnostics(diags)
-		return 1
+		return c.showResults(diags, jsonOutput)
 	}
 
 	// Before we delegate to the backend, we'll print any warning diagnostics
 	// we've accumulated here, since the backend will start fresh with its own
 	// diagnostics.
-	c.showDiagnostics(diags)
-	diags = nil
+	if jsonOutput {
+		tmp := diags[:0]
+		for _, d := range diags {
+			if d.Severity() == tfdiags.Warning {
+				tmp = append(tmp, d)
+			}
+		}
+		diags = tmp
+	} else {
+		// only show results if we're not outputting JSON
+		c.showResults(diags, jsonOutput)
+		diags = nil
+	}
 
 	// Build the operation
 	opReq := c.Operation(be)
@@ -150,8 +163,9 @@ func (c *ApplyCommand) Run(args []string) int {
 
 	opReq.ConfigLoader, err = c.initConfigLoader()
 	if err != nil {
-		c.showDiagnostics(err)
-		return 1
+		diags = diags.Append(err)
+		return c.showResults(diags, jsonOutput)
+		//return 1
 	}
 
 	{
@@ -159,26 +173,30 @@ func (c *ApplyCommand) Run(args []string) int {
 		opReq.Variables, moreDiags = c.collectVariableValues()
 		diags = diags.Append(moreDiags)
 		if moreDiags.HasErrors() {
-			c.showDiagnostics(diags)
-			return 1
+			return c.showResults(diags, jsonOutput)
 		}
 	}
 
 	op, err := c.RunOperation(be, opReq)
 	if err != nil {
-		c.showDiagnostics(err)
-		return 1
+		diags = diags.Append(err.Error())
+		return c.showResults(diags, jsonOutput)
 	}
 	if op.Result != backend.OperationSuccess {
 		return op.Result.ExitStatus()
 	}
 
 	if !c.Destroy {
-		if outputs := outputsAsString(op.State, addrs.RootModuleInstance, true); outputs != "" {
-			c.Ui.Output(c.Colorize().Color(outputs))
+		if jsonOutput {
+			// c.Ui.Output("This is a test")
+		} else {
+			if outputs := outputsAsString(op.State, addrs.RootModuleInstance, true); outputs != "" {
+				c.Ui.Output(c.Colorize().Color(outputs))
+			}
 		}
 	}
 
+	c.showResults(diags, jsonOutput)
 	return op.Result.ExitStatus()
 }
 
@@ -366,3 +384,104 @@ func outputsAsString(state *states.State, modPath addrs.ModuleInstance, includeH
 const outputInterrupt = `Interrupt received.
 Please wait for Terraform to exit or data loss may occur.
 Gracefully shutting down...`
+
+func (c *ApplyCommand) showResults(diags tfdiags.Diagnostics, jsonOutput bool) int {
+	switch {
+	case jsonOutput:
+		// FIXME: Eventually we'll probably want to factor this out somewhere
+		// to support machine-readable outputs for other commands too, but for
+		// now it's simplest to do this inline here.
+		type Pos struct {
+			Line   int `json:"line"`
+			Column int `json:"column"`
+			Byte   int `json:"byte"`
+		}
+		type Range struct {
+			Filename string `json:"filename"`
+			Start    Pos    `json:"start"`
+			End      Pos    `json:"end"`
+		}
+		type Diagnostic struct {
+			Severity string `json:"severity,omitempty"`
+			Summary  string `json:"summary,omitempty"`
+			Detail   string `json:"detail,omitempty"`
+			Range    *Range `json:"range,omitempty"`
+		}
+		type Output struct {
+			// We include some summary information that is actually redundant
+			// with the detailed diagnostics, but avoids the need for callers
+			// to re-implement our logic for deciding these.
+			Success      bool         `json:"success"`
+			ErrorCount   int          `json:"error_count"`
+			WarningCount int          `json:"warning_count"`
+			Diagnostics  []Diagnostic `json:"diagnostics"`
+		}
+
+		var output Output
+		output.Success = true // until proven otherwise
+		for _, diag := range diags {
+			var jsonDiag Diagnostic
+			switch diag.Severity() {
+			case tfdiags.Error:
+				jsonDiag.Severity = "error"
+				output.ErrorCount++
+				output.Success = false
+			case tfdiags.Warning:
+				jsonDiag.Severity = "warning"
+				output.WarningCount++
+			}
+
+			desc := diag.Description()
+			jsonDiag.Summary = desc.Summary
+			jsonDiag.Detail = desc.Detail
+
+			ranges := diag.Source()
+			if ranges.Subject != nil {
+				subj := ranges.Subject
+				jsonDiag.Range = &Range{
+					Filename: subj.Filename,
+					Start: Pos{
+						Line:   subj.Start.Line,
+						Column: subj.Start.Column,
+						Byte:   subj.Start.Byte,
+					},
+					End: Pos{
+						Line:   subj.End.Line,
+						Column: subj.End.Column,
+						Byte:   subj.End.Byte,
+					},
+				}
+			}
+
+			output.Diagnostics = append(output.Diagnostics, jsonDiag)
+		}
+		if output.Diagnostics == nil {
+			// Make sure this always appears as an array in our output, since
+			// this is easier to consume for dynamically-typed languages.
+			output.Diagnostics = []Diagnostic{}
+		}
+
+		j, err := json.MarshalIndent(&output, "", "  ")
+		if err != nil {
+			// Should never happen because we fully-control the input here
+			panic(err)
+		}
+		c.Ui.Output(string(j))
+
+	default:
+		if len(diags) == 0 {
+			c.Ui.Output(c.Colorize().Color("[green][bold]Success![reset] The configuration is valid.\n"))
+		} else {
+			c.showDiagnostics(diags)
+
+			if !diags.HasErrors() {
+				c.Ui.Output(c.Colorize().Color("[green][bold]Success![reset] The configuration is valid, but there were some validation warnings as shown above.\n"))
+			}
+		}
+	}
+
+	if diags.HasErrors() {
+		return 1
+	}
+	return 0
+}
